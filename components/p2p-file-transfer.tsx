@@ -3,6 +3,7 @@
 import type React from "react"
 
 import { useState, useEffect, useRef } from "react"
+import { io, Socket } from "socket.io-client"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
@@ -62,6 +63,9 @@ interface P2PFileTransferProps {
   contactName: string
 }
 
+// ⚠️ You must provide this from your auth/user context
+const currentUserId = "your_current_user_id" 
+
 const getFileIcon = (fileType: string) => {
   if (fileType.startsWith("image/")) return <ImageIcon className="h-5 w-5 text-green-500" />
   if (fileType.startsWith("video/")) return <Video className="h-5 w-5 text-red-500" />
@@ -102,6 +106,7 @@ export function P2PFileTransfer({ isOpen, onClose, contactId, contactName }: P2P
   const [encryptionEnabled, setEncryptionEnabled] = useState(true)
   const [connectionStatus, setConnectionStatus] = useState<"disconnected" | "connecting" | "connected">("disconnected")
   const webrtcRef = useRef<WebRTCFileTransfer | null>(null)
+  const socketRef = useRef<Socket | null>(null)
   const { toast } = useToast()
 
   useEffect(() => {
@@ -114,6 +119,10 @@ export function P2PFileTransfer({ isOpen, onClose, contactId, contactName }: P2P
         webrtcRef.current.close()
         webrtcRef.current = null
       }
+      if (socketRef.current) {
+        socketRef.current.disconnect()
+        socketRef.current = null
+      }
     }
   }, [isOpen])
 
@@ -121,21 +130,71 @@ export function P2PFileTransfer({ isOpen, onClose, contactId, contactName }: P2P
     setConnectionStatus("connecting")
 
     try {
+      // 1. Connect to signaling server
+      if (!socketRef.current) {
+        socketRef.current = io("http://localhost:3000") // Change this to your server URL!
+      }
+      // 2. Register current user
+      socketRef.current.emit("register-user", currentUserId)
+
+      // 3. Setup WebRTCFileTransfer
       webrtcRef.current = new WebRTCFileTransfer(
         (progress) => updateTransferProgress(progress),
         (file) => handleFileReceived(file),
-        (error) => handleTransferError(error),
+        (error) => handleTransferError(error)
       )
 
-      // Simulate connection establishment
-      setTimeout(() => {
+      // 4. Setup signaling for file transfer
+      webrtcRef.current.sendSignalingMessage = (msg: any) => {
+        if (!socketRef.current) return
+        if (msg.type === "offer") {
+          socketRef.current.emit("file-transfer-offer", {
+            toUserId: contactId,
+            offer: msg.offer,
+            fromUserId: currentUserId,
+          })
+        } else if (msg.type === "answer") {
+          socketRef.current.emit("file-transfer-answer", {
+            toUserId: contactId,
+            answer: msg.answer,
+            fromUserId: currentUserId,
+          })
+        } else if (msg.type === "ice-candidate") {
+          socketRef.current.emit("file-transfer-ice-candidate", {
+            toUserId: contactId,
+            candidate: msg.candidate,
+            fromUserId: currentUserId,
+          })
+        }
+      }
+
+      // 5. Receive file signaling events
+      socketRef.current.on("file-transfer-offer", async ({ offer, fromUserId }) => {
+        if (fromUserId !== contactId) return
+        const answer = await webrtcRef.current!.createAnswer(offer)
+        webrtcRef.current!.sendSignalingMessage({ type: "answer", answer })
         setConnectionStatus("connected")
         setIsConnected(true)
         toast({
           title: "P2P Connection Established",
           description: `Connected to ${contactName} for secure file transfer`,
         })
-      }, 2000)
+      })
+      socketRef.current.on("file-transfer-answer", async ({ answer, fromUserId }) => {
+        if (fromUserId !== contactId) return
+        await webrtcRef.current!.handleAnswer(answer)
+        setConnectionStatus("connected")
+        setIsConnected(true)
+        toast({
+          title: "P2P Connection Established",
+          description: `Connected to ${contactName} for secure file transfer`,
+        })
+      })
+      socketRef.current.on("file-transfer-ice-candidate", async ({ candidate, fromUserId }) => {
+        if (fromUserId !== contactId) return
+        await webrtcRef.current!.addIceCandidate(candidate)
+      })
+
     } catch (error) {
       setConnectionStatus("disconnected")
       toast({
